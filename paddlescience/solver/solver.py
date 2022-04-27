@@ -267,6 +267,10 @@ class Solver(object):
 
         # start up program
         self.exe.run(self.startup_program)
+        # import pdb; pdb.set_trace()
+        # paddle.save(self.main_program, './main_program.pdmodel')
+        # paddle.save(self.startup_program, './startup_program.pdmodel')
+        # print(self.main_program)
 
     def feed_data_n(self, data_n):
         self.labels = self.algo.feed_labels_data_n(self.labels,
@@ -302,8 +306,11 @@ class Solver(object):
             rslt = self.exe.run(self.main_program,
                                 feed=feeds,
                                 fetch_list=fetches)
+            # with open('old.txt', 'w') as f:
+            #     for i in range(9):
+            #         f.write('rslt[{}]: '.format(str(i)) + str(rslt[i]))
+            # import pdb; pdb.set_trace()
             print("static epoch: " + str(epoch + 1), "loss: ", rslt[0])
-
         return rslt[1:]
 
     # def __solve_static_dist(self, num_epoch, bs, checkpoint_freq):

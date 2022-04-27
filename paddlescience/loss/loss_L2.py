@@ -76,6 +76,8 @@ class L2(LossBase):
                 pass
                 # TODO: error out
 
+            # import pdb; pdb.set_trace()
+
             if rhs is None:
                 if wgt is None:
                     loss += paddle.norm(rst**2, p=1)
@@ -95,7 +97,6 @@ class L2(LossBase):
                 bs):
 
         cmploss = CompFormula(pde, net)
-
         # compute outs, jacobian, hessian
         cmploss.compute_outs_der(input, bs)  # TODO: dirichlet not need der
 
