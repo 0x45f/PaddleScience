@@ -1,6 +1,3 @@
-import sys
-sys.path.append('/workspace/PaddleScience')
-
 import numpy as np
 import paddle
 from paddle.fluid.incubate.ad_transform.primx import prim2orig, enable_prim, prim_enabled
@@ -164,7 +161,7 @@ def slove_static():
             ret = algo.net.nn_func(var)
             outputs_var.append(ret)
 
-    
+
         # bc loss
         bc_loss = 0.0
         # top
