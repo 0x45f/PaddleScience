@@ -303,6 +303,7 @@ class Solver(object):
                                 feed=feeds,
                                 fetch_list=fetches)
             print("static epoch: " + str(epoch + 1), "loss: ", rslt[0])
+
         return rslt[1:]
 
     # def __solve_static_dist(self, num_epoch, bs, checkpoint_freq):
