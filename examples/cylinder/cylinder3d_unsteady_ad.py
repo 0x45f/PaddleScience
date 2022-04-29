@@ -1,8 +1,27 @@
-import numpy as np
-import paddle
-from paddle.fluid.incubate.ad_transform.primx import prim2orig, enable_prim, prim_enabled
+# Copyright (c) 2022 PaddlePaddle Authors. All Rights Reserved.
+# 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# 
+#     http://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
+import paddle
+import six
+import time
+import numpy as np
 import paddlescience as psci
+from paddle import fluid
+from paddle.fluid import core
+from paddle.fluid.framework import Variable
+from paddle.static import global_scope
+from paddle.fluid.incubate.ad_transform.primx import prim2orig, enable_prim, prim_enabled
 
 paddle.seed(1)
 np.random.seed(1)
@@ -26,6 +45,92 @@ def GetRealPhyInfo(time):
         xyzuvwp = np.ones((1000, 7)).astype(np.float32)
     return xyzuvwp
 
+def compile_and_convert_back_to_program(program=None,
+                                   fetch_list=None,
+                                   fetch_var_name='fetch',
+                                   scope=None,
+                                   use_prune=True,
+                                   loss_name=None):
+    def _add_fetch_ops(program, fetch_list, fetch_var_name):
+        assert isinstance(program, fluid.Program)
+        tmp_program = program.clone()
+        global_block = tmp_program.global_block()
+
+        if fetch_var_name in global_block.vars:
+            fetch_var = global_block.var(fetch_var_name)
+        else:
+            fetch_var = global_block.create_var(
+                name=fetch_var_name,
+                type=core.VarDesc.VarType.FETCH_LIST,
+                persistable=True)
+
+        # append fetch_operators
+        if not fluid.executor.has_fetch_operators(global_block, fetch_list,
+                                                  fetch_var_name, 'fetch'):
+            for i, var in enumerate(fetch_list):
+                assert isinstance(var, Variable) or isinstance(
+                    var, six.string_types), (
+                        "Wrong type for fetch_list[%s]: %s" % (i, type(var)))
+                global_block.append_op(
+                    type='fetch',
+                    inputs={'X': [var]},
+                    outputs={'Out': [fetch_var]},
+                    attrs={'col': i})
+        return tmp_program
+
+    def _remove_fetch_ops(program):
+        assert isinstance(program, fluid.Program)
+        tmp_program = program.clone()
+        global_block = tmp_program.global_block()
+        op_num = len(global_block.ops)
+        for idx in reversed(range(op_num)):
+            if global_block.ops[idx].type == 'fetch':
+                global_block._remove_op(idx)
+
+        return tmp_program
+
+    def _compile(program, loss_name=None):
+        build_strategy = paddle.static.BuildStrategy()
+        exec_strategy = paddle.static.ExecutionStrategy()
+
+        exec_strategy.num_threads = 1
+
+        compiled_program = paddle.static.CompiledProgram(
+            program).with_data_parallel(
+                loss_name=loss_name,
+                build_strategy=build_strategy,
+                exec_strategy=exec_strategy)
+
+        return compiled_program
+
+    if program is None:
+        program = default_main_program()
+
+    if scope is None:
+        scope = global_scope()
+
+    executor = paddle.static.Executor()
+
+    fetch_list = executor._check_fetch_list(fetch_list)
+    fetch_list, optimize_ops = executor._split_optimize_ops_in_fetch_list(
+        fetch_list)
+
+    if optimize_ops:
+        raise ValueError("Unsupport to fetch optimize OP.")
+
+    program_with_fetch_op = _add_fetch_ops(program, fetch_list, fetch_var_name)
+    compiled_program = _compile(program_with_fetch_op, loss_name)
+    assert isinstance(compiled_program, fluid.compiler.CompiledProgram)
+
+    compiled_program._compile(scope, paddle.framework._current_expected_place())
+    compiled_graph = compiled_program._graph
+    ir_graph = fluid.framework.IrGraph(compiled_graph, for_test=True)
+    #ir_graph.draw(save_path='./', name='compiled_graph')
+    ir_program = ir_graph.to_program()
+    final_program = _remove_fetch_ops(ir_program)
+
+    paddle.static.save(final_program, "final")
+    return final_program
 
 def init_algo():
     circle_center = (0.0, 0.0)
@@ -261,6 +366,8 @@ def slove_static():
     for var in outputs_var:
         fetchs.append(var.name)
 
+    main_program = compile_and_convert_back_to_program(main_program, fetch_list=fetchs)
+
     # Solver train t0 -> t1
     print("###################### start time=0.5 train task ############")
     for epoch in range(2):
@@ -276,6 +383,9 @@ def slove_static():
     time_step = 9
     current_uvw = uvw_t1[:, 0:3]
     for i in range(time_step):
+        if i == 3:
+            begin_time = time.time()
+
         current_time = 0.5 + (i + 1) * 0.5
         print("###################### start time=%f train task ############" % current_time)
         self_lables = algo.feed_labels_data_n(labels=self_lables, labels_attr=labels_attr, data_n=current_uvw)
@@ -296,6 +406,9 @@ def slove_static():
         next_uvwp = np.array(next_uvwp)
         current_uvw = next_uvwp[:, 0:3]
 
+    end_time = time.time()
+
+    print(f"\n{time_step - 3} epoch time: {end_time - begin_time} s")
 
 if __name__ == '__main__':
     slove_static()
