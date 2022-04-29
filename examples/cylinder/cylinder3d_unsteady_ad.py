@@ -269,18 +269,12 @@ def slove_static():
 
         # bc loss
         bc_loss = 0.0
-        # top
-        out_i = outputs_var[1]
-        bc_loss += paddle.norm((out_i[:, 0]-1.0)*(out_i[:, 0]-1.0)*1.0, p=1)
-        # import pdb; pdb.set_trace()
-        bc_loss += paddle.norm((out_i[:, 1]-0.0)*(out_i[:, 1]-0.0)*1.0, p=1)
-        bc_loss += paddle.norm((out_i[:, 2]-0.0)*(out_i[:, 2]-0.0)*1.0, p=1)
-        # down, left, right, front, back, circle
-        for i in range(2, 8):
-            out_i = outputs_var[i]
-            # u, v, w
-            for j in range(3):
-                bc_loss += paddle.norm((out_i[:, j]-0.0)*(out_i[:, j]-0.0)*1.0, p=1)
+        for i, name_b in enumerate(inputs_attr["boundary"].keys()):
+            # from outputs_var[1] to outputs_var[7]
+            out_i = outputs_var[i+1]
+            for j in range(len(pde_disc.bc[name_b])):
+                rhs_b = labels_attr["bc"][name_b][j]["rhs"]
+                bc_loss += paddle.norm((out_i[:, j]-rhs_b)*(out_i[:, j]-rhs_b)*1.0, p=1)
 
         # eq loss
         input_i = inputs_var[0] # (51982, 3)
