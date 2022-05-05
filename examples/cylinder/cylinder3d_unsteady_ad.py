@@ -46,10 +46,11 @@ def GetRealPhyInfo(time):
     return xyzuvwp
 
 def compile_and_convert_back_to_program(program=None,
+                                   feed=None,
                                    fetch_list=None,
                                    fetch_var_name='fetch',
                                    scope=None,
-                                   use_prune=True,
+                                   use_prune=False,
                                    loss_name=None):
     def _add_fetch_ops(program, fetch_list, fetch_var_name):
         assert isinstance(program, fluid.Program)
@@ -118,6 +119,10 @@ def compile_and_convert_back_to_program(program=None,
     if optimize_ops:
         raise ValueError("Unsupport to fetch optimize OP.")
 
+    if use_prune:
+        program = executor._prune_program(program, feed, fetch_list, optimize_ops)
+        feed = executor._update_feed(program, feed)
+
     program_with_fetch_op = _add_fetch_ops(program, fetch_list, fetch_var_name)
     compiled_program = _compile(program_with_fetch_op, loss_name)
     assert isinstance(compiled_program, fluid.compiler.CompiledProgram)
@@ -129,7 +134,7 @@ def compile_and_convert_back_to_program(program=None,
     ir_program = ir_graph.to_program()
     final_program = _remove_fetch_ops(ir_program)
 
-    paddle.static.save(final_program, "final")
+    #paddle.static.save(final_program, "final")
     return final_program
 
 def init_algo():
@@ -360,7 +365,7 @@ def slove_static():
     for var in outputs_var:
         fetchs.append(var.name)
 
-    main_program = compile_and_convert_back_to_program(main_program, fetch_list=fetchs)
+    main_program = compile_and_convert_back_to_program(main_program, feed=feeds, fetch_list=fetchs, use_prune=False)
 
     # Solver train t0 -> t1
     print("###################### start time=0.5 train task ############")
