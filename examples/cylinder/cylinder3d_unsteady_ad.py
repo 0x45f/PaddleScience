@@ -279,8 +279,9 @@ def slove_static():
             out_i = outputs_var[i+1]
             for j in range(len(pde_disc.bc[name_b])):
                 rhs_b = labels_attr["bc"][name_b][j]["rhs"]
-                bc_loss += paddle.norm((out_i[:, j]-rhs_b)*(out_i[:, j]-rhs_b)*1.0, p=1)
-
+                wgt_b = labels_attr["bc"][name_b][j]["weight"]
+                bc_loss += paddle.norm((out_i[:, j]-rhs_b)*(out_i[:, j]-rhs_b)*wgt_b, p=1)
+        
         # eq loss
         input_i = inputs_var[0] # (51982, 3)
         out_i = outputs_var[0] # (51982, 4)
