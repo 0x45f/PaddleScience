@@ -33,16 +33,17 @@ class GeometryDiscrete:
         return "TODO: Print for DiscreteGeometry"
 
     def padding(self, nprocs=1):
+        return 
 
         # interior
         if type(self.interior) is np.ndarray:
             self.interior = self.__padding_array(nprocs, self.interior)
 
         # bc
-        for name_b in self.boundary.keys():
-            if type(self.boundary[name_b]) is np.ndarray:
-                self.boundary[name_b] = self.__padding_array(
-                    nprocs, self.boundary[name_b])
+        # for name_b in self.boundary.keys():
+        #     if type(self.boundary[name_b]) is np.ndarray:
+        #         self.boundary[name_b] = self.__padding_array(
+        #             nprocs, self.boundary[name_b])
 
         # data
         if type(self.data) is np.ndarray:
