@@ -15,6 +15,8 @@
 import paddle
 import six
 import time
+import os
+import warnings
 import numpy as np
 import paddlescience as psci
 from paddle import fluid
@@ -23,12 +25,76 @@ from paddle.fluid.framework import Variable
 from paddle.static import global_scope
 from paddle.fluid.incubate.ad_transform.primx import prim2orig, enable_prim, prim_enabled
 
+from paddle.distributed.auto_parallel.completion import Completer
+from paddle.distributed.auto_parallel.partitioner import Partitioner 
+import paddle.distributed.auto_parallel as auto
+from paddle.distributed.auto_parallel.utils import set_var_dist_attr 
+from paddle.distributed.auto_parallel.dist_context import DistributedContext, get_default_distributed_context, set_default_distributed_context
+
 paddle.seed(1)
 np.random.seed(1)
 
 paddle.enable_static()
 enable_prim()
 
+def debug_program(main_program, path):
+    gpu_id = int(os.environ.get('FLAGS_selected_gpus', 0))
+    path += str(gpu_id)
+    with open(path, "w+") as f:
+        f.write(str(main_program))
+
+def set_init_dist_attr(serial_main_prog):
+
+    # set init dp attr    
+    default_dist_context = get_default_distributed_context()
+    _global_parallel_strategy = "dp"
+    _global_process_mesh = auto.ProcessMesh(list(range(paddle.distributed.get_world_size())))
+    x_tensor = serial_main_prog.global_block().var("input0")
+    bc_idx_tensor = serial_main_prog.global_block().var("label0")
+    tensor_dist_attr = set_var_dist_attr(default_dist_context, x_tensor, [-1, -1], _global_process_mesh, mark_annotated=True)
+    tensor_dist_attr = set_var_dist_attr(default_dist_context, bc_idx_tensor, [-1], _global_process_mesh, mark_annotated=True)
+
+def init_comm():
+    from paddle.distributed.auto_parallel.process_group import get_all_process_groups
+    all_process_groups = get_all_process_groups()
+    rank = paddle.distributed.get_rank()
+    for process_group in all_process_groups:
+        if rank not in process_group.ranks:
+            continue
+        process_group.instantiate()
+
+def get_dist_prog(serial_main_prog, serial_startup_prog, params_grads):
+    print("start auto parallel transform, wait ...")
+    start_time = time.time()
+    set_init_dist_attr(serial_main_prog)
+    dist_context = DistributedContext(serial_main_prog, serial_startup_prog)
+
+    # forward completion
+    completer = Completer(dist_context)
+    completer.complete_prim_annotation(serial_main_prog)
+    set_default_distributed_context(dist_context)
+
+    dist_context.block_state.parse_forward_blocks(serial_main_prog)
+    # backward
+    # completer.complete_backward_annotation(serial_main_prog)
+    dist_context.block_state.parse_backward_blocks(serial_main_prog)
+    dist_context.grads_params = dict()
+    for p, g in params_grads:
+        dist_context.grads_params[g.name] = p.name
+    dist_context.synced_gradient = set()
+    dist_context.data_parallel_group = list(range(paddle.distributed.get_world_size()))
+    
+    # parititoner
+    rank = paddle.distributed.get_rank()
+    partitioner = Partitioner(dist_context, rank)
+    dist_main_prog, dist_startup_prog, dist_params_grads = partitioner.partition(
+    serial_main_prog, serial_startup_prog, params_grads)
+
+    assert set(dist_context.grads_params.keys()) == dist_context.synced_gradient
+
+    init_comm()
+    print("auto parallel transform finish in {} sec.".format(time.time() - start_time))
+    return dist_main_prog, dist_startup_prog, dist_params_grads
 
 def GenInitPhyInfo(xyz):
     uvwp = np.zeros((len(xyz), 3)).astype(np.float32)
@@ -235,6 +301,34 @@ def slove_static():
     inputs, inputs_attr = algo.create_inputs(pde_disc)
     labels, labels_attr = algo.create_labels(pde_disc)
 
+    # distributed info 
+    nranks = paddle.distributed.get_world_size()
+    rank = paddle.distributed.get_rank()
+
+    # （lbsz, start_offset, end_offset(not include)）
+    input_partition_meta = []
+    for i in range(len(inputs)):
+        gbsz = inputs[i].shape[0]
+        lbsz = gbsz // nranks
+        # last rank would contain more data
+        start_idx = rank * lbsz
+        end_idx = (rank + 1) * lbsz
+        if rank == nranks - 1:
+            lbsz += gbsz % nranks
+            end_idx += gbsz % nranks
+        input_partition_meta.append((lbsz, start_idx, end_idx))
+    
+    label_partition_meta = []
+    for gbsz in [51982, 51982, 51982, 1000, 1000, 1000, 1000]:
+        lbsz = gbsz // nranks
+        # last rank would contain more data
+        start_idx = rank * lbsz
+        end_idx = (rank + 1) * lbsz
+        if rank == nranks - 1:
+            lbsz += gbsz % nranks
+            end_idx += gbsz % nranks
+        label_partition_meta.append((lbsz, start_idx, end_idx))    
+
     main_program = paddle.static.Program()
     startup_program = paddle.static.Program()
 
@@ -247,19 +341,20 @@ def slove_static():
         # inputs
         for i in range(len(inputs)):
             #inputs
+            # data parallel partition data 
+            shape_ = list(inputs[i].shape)
+            shape_[0] = input_partition_meta[i][0]
             input = paddle.static.data(
                 name='input' + str(i),
-                shape=inputs[i].shape,
+                shape=shape_,
                 dtype='float32')
             input.stop_gradient = False
             inputs_var.append(input)
 
         for i in range(len(labels)):
             #labels
-            if i in [0, 1, 2]:
-                shape = (51982, )
-            else:
-                shape = (1000, )
+            # data parallel partition data 
+            shape = (label_partition_meta[i][0],)
             label = paddle.static.data(
                 name='label' + str(i),
                 shape=shape,
@@ -279,8 +374,9 @@ def slove_static():
             out_i = outputs_var[i+1]
             for j in range(len(pde_disc.bc[name_b])):
                 rhs_b = labels_attr["bc"][name_b][j]["rhs"]
-                bc_loss += paddle.norm((out_i[:, j]-rhs_b)*(out_i[:, j]-rhs_b)*1.0, p=1)
-
+                wgt_b = labels_attr["bc"][name_b][j]["weight"]
+                bc_loss += paddle.norm((out_i[:, j]-rhs_b)*(out_i[:, j]-rhs_b)*wgt_b, p=1)
+        
         # eq loss
         input_i = inputs_var[0] # (51982, 3)
         out_i = outputs_var[0] # (51982, 4)
@@ -338,18 +434,32 @@ def slove_static():
         # total_loss
         total_loss = paddle.sqrt(bc_loss) + paddle.sqrt(eq_loss) + paddle.sqrt(data_loss)
 
-        paddle.fluid.optimizer.AdamOptimizer(0.001).minimize(total_loss)
-        if prim_enabled():
+        opt_ops, param_grads = paddle.fluid.optimizer.AdamOptimizer(0.001).minimize(total_loss)
+        debug_program(main_program, "./prim_program.txt.")
+
+    if prim_enabled():
+        if nranks > 1:
+            main_program, startup_program, dist_params_grads = get_dist_prog(main_program, startup_program, param_grads)
+            debug_program(main_program, "./auto_parallel_program.txt.")
+        with paddle.static.program_guard(main_program, startup_program):
             prim2orig(main_program.block(0))
+        debug_program(main_program, "./orign_program.txt.")
 
 
-    place = paddle.CUDAPlace(0)
+    gpu_id = int(os.environ.get('FLAGS_selected_gpus', 0))
+    place = paddle.CUDAPlace(gpu_id)
     exe = paddle.static.Executor(place)
     exe.run(startup_program)
 
     feeds = dict()
     for i in range(len(inputs)):
-        feeds['input' + str(i)] = inputs[i]
+        # data parallel partition data
+        if nranks > 1:
+            start = input_partition_meta[i][1]
+            end = input_partition_meta[i][2]
+            feeds['input' + str(i)] = inputs[i][start: end]            
+        else:
+            feeds['input' + str(i)] = inputs[i]
 
     real_xyzuvwp = GetRealPhyInfo(0.5)
     real_xyz = real_xyzuvwp[:, 0:3]
@@ -359,13 +469,20 @@ def slove_static():
     self_lables = algo.feed_labels_data_n(labels=labels, labels_attr=labels_attr, data_n=uvw)
     self_lables = algo.feed_labels_data(labels=self_lables, labels_attr=labels_attr, data=real_uvwp)
     for i in range(len(self_lables)):
-        feeds['label' + str(i)] = self_lables[i]
+        # data parallel partition data
+        if nranks > 1:
+            start = label_partition_meta[i][1]
+            end = label_partition_meta[i][2]
+            feeds['label' + str(i)] = self_lables[i][start: end]            
+        else:    
+            feeds['label' + str(i)] = self_lables[i]
 
     fetchs = [total_loss.name]
     for var in outputs_var:
         fetchs.append(var.name)
 
     main_program = compile_and_convert_back_to_program(main_program, feed=feeds, fetch_list=fetchs, use_prune=False)
+    debug_program(main_program, "./compiled_converted_program.txt.")
 
     # Solver train t0 -> t1
     print("###################### start time=0.5 train task ############")
@@ -393,7 +510,17 @@ def slove_static():
         self_lables = algo.feed_labels_data(labels=self_lables, labels_attr=labels_attr, data=real_uvwp)
         
         for i in range(len(self_lables)):
-            feeds['label' + str(i)] = self_lables[i]
+            # data parallel partition data
+            # NOTE first three label already partitioned.
+            if nranks > 1:
+                if i in [0,1,2]:
+                    feeds['label' + str(i)] = self_lables[i]
+                else:
+                    start = label_partition_meta[i][1]
+                    end = label_partition_meta[i][2]                    
+                    feeds['label' + str(i)] = self_lables[i][start: end]
+            else:                
+                feeds['label' + str(i)] = self_lables[i]
 
         for epoch in range(2):
             rslt = exe.run(main_program,
