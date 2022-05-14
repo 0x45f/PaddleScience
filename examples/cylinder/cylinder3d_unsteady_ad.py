@@ -388,7 +388,11 @@ def slove_static():
         fetches.append(var.name)
 
     main_program = compile_and_convert_back_to_program(
-        main_program, feed=feeds, fetch_list=fetches, use_prune=True)
+        main_program,
+        feed=feeds,
+        fetch_list=fetches,
+        use_prune=True,
+        loss_name=total_loss.name)
 
     # num_epoch in train
     train_epoch = 2000
