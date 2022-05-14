@@ -22,6 +22,7 @@ from paddle.fluid.framework import Variable
 from paddle.static import global_scope
 from paddle.incubate.autograd.primx import prim2orig
 from paddle.incubate.autograd.utils import enable_prim, prim_enabled
+# from paddle.fluid.incubate.ad_transform.primx import prim2orig, enable_prim, prim_enabled
 
 paddle.seed(1)
 np.random.seed(1)
@@ -183,7 +184,7 @@ def init_algo():
     )
 
     # discretize geometry
-    geo_disc = geo.discretize(npoints=40000, method="sampling")
+    geo_disc = geo.discretize(npoints=80000, method="sampling")
     # the real_cord need to be added in geo_disc
     real_cord = GetRealPhyInfo(start_time, need_cord=True)
     geo_disc.user = real_cord
@@ -323,7 +324,7 @@ def slove_static():
         for i in range(len(labels)):
             # Hard code here for label shape. Shape may change when random seed changed 
             if i in [0, 1, 2]:
-                shape = (37174, )
+                shape = (75570, )
             else:
                 shape = (3415, )
             label = paddle.static.data(
