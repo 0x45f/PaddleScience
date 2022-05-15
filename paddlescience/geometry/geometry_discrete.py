@@ -33,6 +33,7 @@ class GeometryDiscrete:
         return "TODO: Print for DiscreteGeometry"
 
     def padding(self, nprocs=1):
+        return 
 
         # interior
         if type(self.interior) is np.ndarray:
