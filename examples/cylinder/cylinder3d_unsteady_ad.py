@@ -16,7 +16,7 @@ import numpy as np
 import paddlescience as psci
 import paddle
 from paddle.incubate.autograd import prim2orig, enable_prim, prim_enabled
-from utils import l2_norm_square, compute_eq_loss, compile_and_convert_back_to_program
+from utils import l2_norm_square, compute_bc_loss, compute_eq_loss, compile_and_convert_back_to_program, create_inputs_var, create_labels_var
 
 paddle.seed(1)
 np.random.seed(1)
@@ -27,6 +27,7 @@ enable_prim()
 # define start time and time step
 start_time = 100
 time_step = 1
+npoints = 40000
 
 
 # load real data
@@ -68,7 +69,7 @@ geo.add_boundary(
     criteria=lambda x, y, z: ((x - cc[0])**2 + (y - cc[1])**2 - cr**2) < 1e-4)
 
 # discretize geometry
-geo_disc = geo.discretize(npoints=40000, method="sampling")
+geo_disc = geo.discretize(npoints=npoints, method="sampling")
 # the real_cord need to be added in geo_disc
 real_cord = GetRealPhyInfo(start_time, need_cord=True)
 geo_disc.user = real_cord
@@ -105,15 +106,12 @@ pde.add_bc("circle", bc_circle_u, bc_circle_v, bc_circle_w)
 pde_disc = pde.discretize(
     time_method="implicit", time_step=time_step, geo_disc=geo_disc)
 
-# Network
+# declare network
 net = psci.network.FCNet(
     num_ins=3, num_outs=4, num_layers=10, hidden_size=50, activation='tanh')
 
-# Loss
-loss = psci.loss.L2(p=2)
-
 # Algorithm
-algo = psci.algorithm.PINNs(net=net, loss=loss)
+algo = psci.algorithm.PINNs(net=net, loss=None)
 
 # create inputs/labels and its attributes
 inputs, inputs_attr = algo.create_inputs(pde_disc)
@@ -123,56 +121,19 @@ main_program = paddle.static.Program()
 startup_program = paddle.static.Program()
 
 with paddle.static.program_guard(main_program, startup_program):
+    # build and apply network
     algo.net.make_network_static()
-    inputs_var = []
-    labels_var = []
-    outputs_var = []
-
-    # inputs
-    for i in range(len(inputs)):
-        input = paddle.static.data(
-            name='input' + str(i), shape=inputs[i].shape, dtype='float32')
-        input.stop_gradient = False
-        inputs_var.append(input)
-
-    # labels
-    for i in range(len(labels)):
-        # Hard code here for label shape. Shape may change when random seed changed 
-        if i in [0, 1, 2]:
-            shape = (37174, )
-        else:
-            shape = (3415, )
-        label = paddle.static.data(
-            name='label' + str(i), shape=shape, dtype='float32')
-        label.stop_gradient = False
-        labels_var.append(label)
-
-    for var in inputs_var:
-        ret = algo.net.nn_func(var)
-        outputs_var.append(ret)
+    inputs_var = create_inputs_var(inputs)
+    labels_var = create_labels_var(labels, npoints)
+    outputs_var = [algo.net.nn_func(var) for var in inputs_var]
 
     # bc loss
-    name2index = {'u': 0, 'v': 1, 'w': 2, 'p': 3}
-    bc_loss = 0.0
-    name_list = []
-    for i, name_b in enumerate(inputs_attr["bc"].keys()):
-        # from outputs_var[1] to outputs_var[3]
-        out_el = outputs_var[i + 1]
-        for j in range(len(pde_disc.bc[name_b])):
-            rhs_b = labels_attr["bc"][name_b][j]["rhs"]
-            wgt_b = labels_attr["bc"][name_b][j]["weight"]
-            index = name2index.get(pde_disc.bc[name_b][j].name)
+    bc_loss = compute_bc_loss(inputs_attr, labels_attr, outputs_var, pde_disc)
 
-            bc_loss += l2_norm_square(
-                (out_el[:, index] - rhs_b) * np.sqrt(wgt_b), 10000)
-
-    # inputs_var[0] eq loss
+    # eq loss
     output_var_0_eq_loss = compute_eq_loss(inputs_var[0], outputs_var[0],
                                            labels_var[0:3])
 
-    # inputs_var[4] eq loss
-    input_i = inputs_var[4]
-    out_i = outputs_var[4]
     output_var_4_eq_loss = compute_eq_loss(inputs_var[4], outputs_var[4],
                                            labels_var[7:10])
     # data_loss
@@ -193,13 +154,10 @@ place = paddle.CUDAPlace(0)
 exe = paddle.static.Executor(place)
 exe.run(startup_program)
 
-feeds = dict()
-for i in range(len(inputs)):
-    feeds['input' + str(i)] = inputs[i]
+inputs_name = [var.name for var in inputs_var]
+feeds = dict(zip(inputs_name, inputs))
 
-fetches = [total_loss.name]
-for var in outputs_var:
-    fetches.append(var.name)
+fetches = [total_loss.name] + [var.name for var in outputs_var]
 
 main_program = compile_and_convert_back_to_program(
     main_program,

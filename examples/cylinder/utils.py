@@ -21,12 +21,54 @@ from paddle.fluid.framework import Variable
 from paddle.static import global_scope
 
 
+def create_inputs_var(inputs):
+    inputs_var = []
+    for i in range(len(inputs)):
+        input = paddle.static.data(
+            name='input' + str(i), shape=inputs[i].shape, dtype='float32')
+        input.stop_gradient = False
+        inputs_var.append(input)
+    return inputs_var
+
+
+def create_labels_var(labels, npoints):
+    assert npoints == 40000
+    labels_var = []
+    for i in range(len(labels)):
+        if i in [0, 1, 2]:
+            shape = (37174, )
+        else:
+            shape = (3415, )
+        label = paddle.static.data(
+            name='label' + str(i), shape=shape, dtype='float32')
+        label.stop_gradient = False
+        labels_var.append(label)
+    return labels_var
+
+
 def l2_norm_square(x, scale=None):
     if scale is None:
         l2_norm = paddle.norm(x, p=2)
     else:
         l2_norm = paddle.norm(x * scale, p=2) / scale
     return l2_norm * l2_norm
+
+
+def compute_bc_loss(inputs_attr, labels_attr, outputs_var, pde_disc):
+    name2index = {'u': 0, 'v': 1, 'w': 2, 'p': 3}
+    bc_loss = 0.0
+    name_list = []
+    for i, name_b in enumerate(inputs_attr["bc"].keys()):
+        # from outputs_var[1] to outputs_var[3]
+        out_el = outputs_var[i + 1]
+        for j in range(len(pde_disc.bc[name_b])):
+            rhs_b = labels_attr["bc"][name_b][j]["rhs"]
+            wgt_b = labels_attr["bc"][name_b][j]["weight"]
+            index = name2index.get(pde_disc.bc[name_b][j].name)
+
+            bc_loss += l2_norm_square(
+                (out_el[:, index] - rhs_b) * np.sqrt(wgt_b), 10000)
+    return bc_loss
 
 
 def compute_eq_loss(inputs, outputs, labels_var):
@@ -67,7 +109,6 @@ def compute_eq_loss(inputs, outputs, labels_var):
     rho = 1.0
     dt = 1.0
     continuty = jac0[:, 0] + jac1[:, 1] + jac2[:, 2]
-    # + u / dt - u_n / dt
     momentum_x = u / dt - u_n / dt + u * jac0[:, 0] + v * jac0[:, 1] + w * jac0[:, 2] - \
                 nu / rho * hes0[:, 0] - nu / rho * hes1[:, 1] - nu / rho * hes2[:, 2] + \
                 1.0 / rho * jac3[:, 0]
@@ -176,9 +217,7 @@ def compile_and_convert_back_to_program(program=None,
                               paddle.framework._current_expected_place())
     compiled_graph = compiled_program._graph
     ir_graph = fluid.framework.IrGraph(compiled_graph, for_test=True)
-    #ir_graph.draw(save_path='./', name='compiled_graph')
     ir_program = ir_graph.to_program()
     final_program = _remove_fetch_ops(ir_program)
 
-    #paddle.static.save(final_program, "final")
     return final_program
