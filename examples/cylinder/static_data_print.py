@@ -46,7 +46,7 @@ geo.add_boundary(
 
 # discretize geometry
 print("ATTENTION! ####### The npoints must be same in your code! ########")
-geo_disc = geo.discretize(npoints=80000, method="sampling")
+geo_disc = geo.discretize(npoints=40000, method="sampling")
 
 # the real_cord need to be added in geo_disc
 real_cord = GetRealPhyInfo(start_time)[:, 0:3]
