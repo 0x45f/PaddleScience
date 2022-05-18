@@ -20,16 +20,34 @@ from paddle.fluid import core
 from paddle.fluid.framework import Variable
 from paddle.static import global_scope
 
+# auto parallel
+import paddle.distributed.auto_parallel as auto
+from paddle.distributed.auto_parallel.completion import Completer
+from paddle.distributed.auto_parallel.partitioner import Partitioner 
+from paddle.distributed.auto_parallel.utils import set_var_dist_attr 
+from paddle.distributed.auto_parallel.dist_context import DistributedContext, get_default_distributed_context, set_default_distributed_context
+nranks = paddle.distributed.get_world_size()
+rank = paddle.distributed.get_rank()
 
 def create_inputs_var(inputs):
     inputs_var = []
     for i in range(len(inputs)):
+
+        # data parallel partition
+        shape = list(inputs[i].shape)
+        if nranks > 1:
+            gbsz = inputs[i].shape[0]
+            lbsz = gbsz // nranks
+            # uneven data partition, last rank would contain more data
+            if rank == nranks - 1:
+                lbsz += gbsz % nranks
+            shape[0] = lbsz
+            
         input = paddle.static.data(
-            name='input' + str(i), shape=inputs[i].shape, dtype='float32')
+            name='input' + str(i), shape=shape, dtype='float32')
         input.stop_gradient = False
         inputs_var.append(input)
     return inputs_var
-
 
 def create_labels_var(labels, npoints):
     assert npoints == 40000
@@ -39,12 +57,39 @@ def create_labels_var(labels, npoints):
             shape = (37174, )
         else:
             shape = (3415, )
+
+        # data parallel partition
+        if nranks > 1:
+            gbsz = shape[0]
+            lbsz = gbsz // nranks  
+            if rank == nranks - 1:
+                lbsz += gbsz % nranks   
+            shape = (lbsz,)   
+
         label = paddle.static.data(
             name='label' + str(i), shape=shape, dtype='float32')
         label.stop_gradient = False
         labels_var.append(label)
     return labels_var
 
+def data_parallel_partition(data, time_step = 0):
+    if nranks <= 1:
+        return data
+
+    for i in range(len(data)):
+        # first 3 labels are output from last time step and are already partitioned
+        if time_step > 0 and i in [0, 1, 2]:
+            continue
+        
+        gbsz = data[i].shape[0]
+        lbsz = gbsz // nranks  
+        start = rank * lbsz
+        end = (rank + 1) * lbsz
+        if rank == nranks - 1:
+            end += gbsz % nranks    
+        data[i] = data[i][start: end]    
+
+    return data
 
 def l2_norm_square(x, scale=None):
     if scale is None:
@@ -221,3 +266,49 @@ def compile_and_convert_back_to_program(program=None,
     final_program = _remove_fetch_ops(ir_program)
 
     return final_program
+
+def set_init_dist_attr(serial_main_prog):
+
+    # set init dp attr    
+    default_dist_context = get_default_distributed_context()
+    _global_parallel_strategy = "dp"
+    _global_process_mesh = auto.ProcessMesh(list(range(nranks)))
+    x_tensor = serial_main_prog.global_block().var("input0")
+    bc_idx_tensor = serial_main_prog.global_block().var("label0")
+    tensor_dist_attr = set_var_dist_attr(default_dist_context, x_tensor, [-1, -1], _global_process_mesh, mark_annotated=True)
+    tensor_dist_attr = set_var_dist_attr(default_dist_context, bc_idx_tensor, [-1], _global_process_mesh, mark_annotated=True)
+
+def init_comm():
+    from paddle.distributed.auto_parallel.process_group import get_all_process_groups
+    all_process_groups = get_all_process_groups()
+    for process_group in all_process_groups:
+        if rank not in process_group.ranks:
+            continue
+        process_group.instantiate()
+
+def convert_to_distributed_program(serial_main_prog, serial_startup_prog, params_grads):
+    set_init_dist_attr(serial_main_prog)
+    dist_context = DistributedContext(serial_main_prog, serial_startup_prog)
+
+    # forward completion
+    completer = Completer(dist_context)
+    completer.complete_prim_annotation(serial_main_prog)
+    set_default_distributed_context(dist_context)
+    dist_context.block_state.parse_forward_blocks(serial_main_prog)
+
+    # backward
+    dist_context.block_state.parse_backward_blocks(serial_main_prog)
+    dist_context.grads_params = dict()
+    for p, g in params_grads:
+        dist_context.grads_params[g.name] = p.name
+    dist_context.synced_gradient = set()
+    dist_context.data_parallel_group = list(range(nranks))
+    
+    # parititoner
+    partitioner = Partitioner(dist_context, rank)
+    dist_main_prog, dist_startup_prog, dist_params_grads = partitioner.partition(
+    serial_main_prog, serial_startup_prog, params_grads)
+    assert set(dist_context.grads_params.keys()) == dist_context.synced_gradient
+
+    init_comm()
+    return dist_main_prog, dist_startup_prog
