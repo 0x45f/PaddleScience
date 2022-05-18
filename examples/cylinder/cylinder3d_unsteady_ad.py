@@ -13,10 +13,11 @@
 # limitations under the License.
 
 import numpy as np
+import os
 import paddlescience as psci
 import paddle
 from paddle.incubate.autograd import prim2orig, enable_prim, prim_enabled
-from utils import l2_norm_square, compute_bc_loss, compute_eq_loss, compile_and_convert_back_to_program, create_inputs_var, create_labels_var
+from utils import l2_norm_square, compute_bc_loss, compute_eq_loss, compile_and_convert_back_to_program, create_inputs_var, create_labels_var, convert_to_distributed_program, data_parallel_partition
 
 paddle.seed(1)
 np.random.seed(1)
@@ -117,6 +118,7 @@ algo = psci.algorithm.PINNs(net=net, loss=None)
 inputs, inputs_attr = algo.create_inputs(pde_disc)
 labels, labels_attr = algo.create_labels(pde_disc)
 
+
 main_program = paddle.static.Program()
 startup_program = paddle.static.Program()
 
@@ -145,16 +147,24 @@ with paddle.static.program_guard(main_program, startup_program):
     # total_loss
     total_loss = paddle.sqrt(bc_loss + output_var_0_eq_loss +
                              output_var_4_eq_loss + data_loss)
-    paddle.optimizer.Adam(0.001).minimize(total_loss)
+    opt_ops, param_grads = paddle.optimizer.Adam(0.001).minimize(total_loss)
 
+# data parallel
+nranks = paddle.distributed.get_world_size()
+if nranks > 1:
+    main_program, startup_program = convert_to_distributed_program(main_program, startup_program, param_grads)
+
+with paddle.static.program_guard(main_program, startup_program):    
     if prim_enabled():
         prim2orig(main_program.block(0))
 
-place = paddle.CUDAPlace(0)
+gpu_id = int(os.environ.get('FLAGS_selected_gpus', 0))
+place = paddle.CUDAPlace(gpu_id)
 exe = paddle.static.Executor(place)
 exe.run(startup_program)
 
 inputs_name = [var.name for var in inputs_var]
+inputs = data_parallel_partition(inputs)
 feeds = dict(zip(inputs_name, inputs))
 
 fetches = [total_loss.name] + [var.name for var in outputs_var]
@@ -185,6 +195,8 @@ for i in range(num_time_step):
     self_lables = algo.feed_data_user_next(
         self_lables, labels_attr, GetRealPhyInfo(
             next_time, need_physic=True))
+    self_lables = data_parallel_partition(self_lables, time_step = i)
+
     for j in range(len(self_lables)):
         feeds['label' + str(j)] = self_lables[j]
 
